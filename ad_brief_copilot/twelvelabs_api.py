@@ -1,4 +1,5 @@
 import json
+import math
 import re
 import time
 
@@ -148,3 +149,62 @@ def index_videos_from_urls(api_key: str, index_name: str, video_urls: list[str])
             time.sleep(5)
 
     return {"index_id": index.id, "video_map": video_map}
+
+
+def _cosine_similarity(a: list[float], b: list[float]) -> float:
+    dot = sum(x * y for x, y in zip(a, b))
+    norm_a = math.sqrt(sum(x * x for x in a))
+    norm_b = math.sqrt(sum(x * x for x in b))
+    if norm_a == 0 or norm_b == 0:
+        return 0.0
+    return dot / (norm_a * norm_b)
+
+
+def get_video_embedding(client: TwelveLabs, index_id: str, video_id: str) -> list[float]:
+    """Get the stored Marengo embedding for an indexed video."""
+    asset = client.indexes.indexed_assets.retrieve(
+        index_id, video_id, embedding_option=["visual"]
+    )
+    segments = asset.embedding.video_embedding.segments or []
+    # Prefer video-scope embedding; fallback to averaging clip embeddings
+    for seg in segments:
+        if seg.embedding_scope == "video" and seg.float_:
+            return seg.float_
+    clip_vecs = [seg.float_ for seg in segments if seg.embedding_scope == "clip" and seg.float_]
+    if clip_vecs:
+        dim = len(clip_vecs[0])
+        return [sum(v[i] for v in clip_vecs) / len(clip_vecs) for i in range(dim)]
+    return []
+
+
+def get_text_embedding(client: TwelveLabs, text: str) -> list[float]:
+    """Get a Marengo text embedding to compare against video embeddings."""
+    resp = client.embed.create(
+        model_name="marengo3.0",
+        text=text,
+    )
+    # resp.text_embedding.segments[0].float_ contains the vector
+    if resp.text_embedding and resp.text_embedding.segments:
+        return resp.text_embedding.segments[0].float_
+    return []
+
+
+def find_similar_by_embedding(
+    client: TwelveLabs, index_id: str, query_text: str, video_ids: list[str], top_k: int = 5,
+) -> list[dict]:
+    """
+    Embed the query text, compare against all video embeddings, return top-K ranked results.
+    """
+    query_vec = get_text_embedding(client, query_text)
+    if not query_vec:
+        return []
+
+    scored = []
+    for vid_id in video_ids:
+        vid_vec = get_video_embedding(client, index_id, vid_id)
+        if vid_vec:
+            score = _cosine_similarity(query_vec, vid_vec)
+            scored.append({"video_id": vid_id, "score": score})
+
+    scored.sort(key=lambda x: x["score"], reverse=True)
+    return scored[:top_k]

@@ -31,40 +31,94 @@ class SearchAdReferences(foo.Operator):
 
     def resolve_input(self, ctx):
         inputs = types.Object()
-        inputs.str("query", required=True, label="Search Query")
-        inputs.str("index_id", required=True, label="Twelve Labs Index ID")
-        inputs.int("top_k", default=10, label="Number of Results")
+        inputs.str("query", required=True, label="Describe the campaign you want references for")
+        inputs.int("top_k", default=6, label="Number of Results")
         return types.Property(inputs)
 
     def execute(self, ctx):
+        import math
+        from twelvelabs import TwelveLabs as TL
+
         api_key = ctx.secret("TWELVE_LABS_API_KEY") or os.getenv("TWELVE_LABS_API_KEY")
-        client = get_client(api_key)
+        client = TL(api_key=api_key)
 
         query = ctx.params["query"]
-        index_id = ctx.params["index_id"]
-        top_k = ctx.params.get("top_k", 10)
+        index_id = ctx.dataset.info.get("index_id", "")
+        top_k = ctx.params.get("top_k", 6)
 
-        results = search_videos(client, index_id, query, top_k)
+        # Get text embedding for the query
+        resp = client.embed.create(model_name="marengo3.0", text=query)
+        query_vec = resp.text_embedding.segments[0].float_ if resp.text_embedding and resp.text_embedding.segments else []
 
+        if not query_vec:
+            return {"message": "Failed to create text embedding"}
+
+        # Score each video by embedding cosine similarity
+        scored = []
+        for sample in ctx.dataset:
+            try:
+                vid_id = sample["twelvelabs_video_id"]
+            except (KeyError, AttributeError):
+                continue
+
+            asset = client.indexes.indexed_assets.retrieve(index_id, vid_id, embedding_option=["visual"])
+            vid_vec = None
+            for seg in (asset.embedding.video_embedding.segments or []):
+                if seg.embedding_scope == "video" and seg.float_:
+                    vid_vec = seg.float_
+                    break
+            if not vid_vec:
+                clips = [s.float_ for s in (asset.embedding.video_embedding.segments or []) if s.embedding_scope == "clip" and s.float_]
+                if clips:
+                    dim = len(clips[0])
+                    vid_vec = [sum(v[i] for v in clips) / len(clips) for i in range(dim)]
+
+            if vid_vec:
+                dot = sum(x * y for x, y in zip(query_vec, vid_vec))
+                na = math.sqrt(sum(x * x for x in query_vec))
+                nb = math.sqrt(sum(x * x for x in vid_vec))
+                score = dot / (na * nb) if na and nb else 0.0
+                scored.append({"video_id": vid_id, "score": score})
+
+        scored.sort(key=lambda x: x["score"], reverse=True)
+        results = scored[:top_k]
         score_map = {r["video_id"]: r["score"] for r in results}
 
-        view = ctx.dataset.match(
-            F("twelvelabs_video_id").is_in(list(score_map.keys()))
-        )
+        for sample in ctx.dataset:
+            try:
+                vid_id = sample["twelvelabs_video_id"]
+                sample["relevance_score"] = score_map.get(vid_id, 0.0)
+                sample.save()
+            except (KeyError, AttributeError):
+                pass
 
-        for sample in view:
-            sample["relevance_score"] = score_map.get(
-                sample["twelvelabs_video_id"], 0.0
-            )
-            sample.save()
-
+        view = ctx.dataset.sort_by("relevance_score", reverse=True)
         ctx.ops.set_view(view=view)
 
-        return {"message": f"Found {len(results)} matching videos"}
+        # Build a video_id → filename map
+        id_to_name = {}
+        for sample in ctx.dataset:
+            try:
+                vid_id = sample["twelvelabs_video_id"]
+                id_to_name[vid_id] = sample.filepath.split("/")[-1]
+            except (KeyError, AttributeError):
+                pass
+
+        top = results[0] if results else None
+        msg = f"## Embedding Similarity Results\n\n"
+        msg += f"Query: **{query}**\n\n"
+        msg += "| Rank | Ad | Score |\n|---|---|---|\n"
+        for i, r in enumerate(results):
+            name = id_to_name.get(r["video_id"], r["video_id"])
+            msg += f"| {i+1} | {name} | {r['score']:.4f} |\n"
+        if top:
+            top_name = id_to_name.get(top["video_id"], top["video_id"])
+            msg += f"\n**Top reference ad:** {top_name}"
+        return {"message": msg}
 
     def resolve_output(self, ctx):
         outputs = types.Object()
-        outputs.str("message", label="Result")
+        outputs.str("message", label="Result", view=types.MarkdownView())
         return types.Property(outputs)
 
 
@@ -270,10 +324,10 @@ class GenerateBrief(foo.Operator):
         for sample in ctx.view:
             try:
                 score = sample["relevance_score"]
-                if score and score > best_score:
+                if score is not None and score > best_score:
                     best_score = score
                     best_sample = sample
-            except AttributeError:
+            except (KeyError, AttributeError):
                 pass
 
         # Fallback to first sample if no scores
