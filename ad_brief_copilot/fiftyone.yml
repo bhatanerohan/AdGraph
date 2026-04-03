@@ -1,0 +1,12 @@
+name: ad-brief-copilot
+description: "Find reference ads, extract creative traits, synthesize patterns, and generate briefs using Twelve Labs"
+version: 0.1.0
+fiftyone:
+  version: ">=0.21"
+operators:
+  - search_ad_references
+  - extract_ad_traits
+  - synthesize_patterns
+  - generate_brief
+secrets:
+  - TWELVE_LABS_API_KEY
