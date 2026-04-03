@@ -57,7 +57,14 @@ def search_videos(client: TwelveLabs, index_id: str, query: str, top_k: int) -> 
 
 
 def extract_traits(api_key: str, video_id: str) -> dict:
+    import logging
+    logger = logging.getLogger(__name__)
+    logger.warning(f"extract_traits called with api_key type={type(api_key).__name__}, video_id={video_id}")
+    logger.warning(f"TwelveLabs imported from: {TwelveLabs.__module__}")
+
     client = get_client(api_key)
+    logger.warning(f"client type={type(client).__name__}, has analyze={hasattr(client, 'analyze')}")
+
     response = client.analyze(
         video_id=video_id,
         prompt=TRAIT_EXTRACTION_PROMPT,

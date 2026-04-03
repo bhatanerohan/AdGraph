@@ -81,7 +81,23 @@ class ExtractAdTraits(foo.Operator):
         return types.Property(inputs)
 
     def execute(self, ctx):
+        from twelvelabs import TwelveLabs as TL
+
         api_key = ctx.secret("TWELVE_LABS_API_KEY") or os.getenv("TWELVE_LABS_API_KEY")
+        client = TL(api_key=api_key)
+
+        trait_prompt = (
+            'Analyze this ad video and return ONLY a JSON object with these exact fields: '
+            '{"hook_type": "<one of: question, stat, emotion, product-first>", '
+            '"pacing": "<one of: fast-cuts, slow-build, single-shot>", '
+            '"tone": "<one of: aspirational, humorous, urgent, educational>", '
+            '"cta_style": "<one of: direct, soft, none>", '
+            '"visual_style": "<one of: cinematic, lo-fi, text-heavy, product-closeup>", '
+            '"first_3_seconds": "<one sentence describing exactly what happens in the first 3 seconds>", '
+            '"talent_type": "<one of: none, actor, ugc-creator, brand-mascot>", '
+            '"product_visibility": "<one of: early, late, throughout, none>"} '
+            'Return only the JSON object, no other text.'
+        )
 
         count = 0
         for sample in ctx.view:
@@ -92,7 +108,14 @@ class ExtractAdTraits(foo.Operator):
             if not video_id:
                 continue
 
-            traits = extract_traits(api_key, video_id)
+            # Extract traits via analyze
+            resp = client.analyze(video_id=video_id, prompt=trait_prompt)
+            raw = resp.data
+            try:
+                traits = json.loads(raw)
+            except (json.JSONDecodeError, TypeError):
+                match = re.search(r'\{[^{}]*\}', raw, re.DOTALL)
+                traits = json.loads(match.group()) if match else {}
 
             sample["hook_type"] = traits.get("hook_type")
             sample["pacing"] = traits.get("pacing")
@@ -103,11 +126,19 @@ class ExtractAdTraits(foo.Operator):
             sample["talent_type"] = traits.get("talent_type")
             sample["product_visibility"] = traits.get("product_visibility")
 
-            chapters = extract_scene_chapters(api_key, video_id)
-            if chapters:
-                sample["chapters"] = chapters
-            sample.save()
+            # Extract chapters
+            try:
+                ch_resp = client.analyze(
+                    video_id=video_id,
+                    prompt="List the chapters of this video as a JSON array with fields: title, summary, start, end. Return only valid JSON.",
+                )
+                ch_match = re.search(r'\[.*\]', ch_resp.data, re.DOTALL)
+                if ch_match:
+                    sample["chapters"] = json.loads(ch_match.group())
+            except Exception:
+                pass
 
+            sample.save()
             count += 1
             time.sleep(0.5)
 
@@ -219,30 +250,56 @@ class GenerateBrief(foo.Operator):
     def resolve_input(self, ctx):
         inputs = types.Object()
         inputs.str(
-            "top_video_id",
-            required=True,
-            label="Reference Video ID (from search results)",
-        )
-        inputs.str(
             "brand_context",
-            required=False,
-            label="Brand/Product Context (optional)",
+            required=True,
+            label="Brand/Product Context (e.g. 'luxury electric vehicle launch')",
         )
         return types.Property(inputs)
 
     def execute(self, ctx):
-        api_key = ctx.secret("TWELVE_LABS_API_KEY") or os.getenv("TWELVE_LABS_API_KEY")
+        from twelvelabs import TwelveLabs as TL
 
-        top_video_id = ctx.params["top_video_id"]
-        brand_context = ctx.params.get("brand_context", "")
+        api_key = ctx.secret("TWELVE_LABS_API_KEY") or os.getenv("TWELVE_LABS_API_KEY")
+        client = TL(api_key=api_key)
+
+        brand_context = ctx.params["brand_context"]
+
+        # Auto-pick the top-scored video from the current view
+        best_sample = None
+        best_score = -1
+        for sample in ctx.view:
+            try:
+                score = sample["relevance_score"]
+                if score and score > best_score:
+                    best_score = score
+                    best_sample = sample
+            except AttributeError:
+                pass
+
+        # Fallback to first sample if no scores
+        if best_sample is None:
+            best_sample = ctx.view.first()
+
+        top_video_id = best_sample["twelvelabs_video_id"]
 
         pattern_summary = ctx.dataset.info.get(
             "pattern_summary", "No pattern analysis available."
         )
 
-        brief_text = tl_generate_brief(
-            api_key, top_video_id, pattern_summary, brand_context
+        prompt = (
+            f"You are a creative strategist. Here is a pattern analysis of top-performing reference ads:\n\n"
+            f"{pattern_summary}\n\n"
+            f"Brand/Product Context: {brand_context}\n\n"
+            f"Using this video as additional creative inspiration, generate a creative brief with:\n"
+            f"1. Recommended hook approach (and why, based on the patterns above)\n"
+            f"2. Pacing template\n"
+            f"3. CTA strategy\n"
+            f"4. Three distinct ad concepts inspired by these patterns\n\n"
+            f"Format the output as clean markdown."
         )
+
+        response = client.analyze(video_id=top_video_id, prompt=prompt)
+        brief_text = response.data
 
         return {"brief": brief_text}
 
